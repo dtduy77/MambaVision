@@ -87,7 +87,7 @@ default_cfgs = {
     'mamba_vision_L3_512_21k': _cfg(url='https://huggingface.co/nvidia/MambaVision-L3-512-21K/resolve/main/mambavision_L3_21k_740m_512.pth.tar',
                             crop_pct=0.93,
                             input_size=(3, 512, 512),
-                            crop_mode='squash'),                               
+                            crop_mode='squash'),
 }
 
 
@@ -117,8 +117,25 @@ def window_reverse(windows, window_size, H, W):
     Returns:
         x: (B, C, H, W)
     """
+    # Calculate batch size B:
+    # - (H * W / window_size / window_size) is the number of windows per image:
+    #   * Stage 3: 28*28 / 14 / 14 = 4 windows per image
+    #   * Stage 4: 14*14 / 7 / 7 = 4 windows per image
+    # - windows.shape[0] is the total number of windows across the batch (e.g. B * 4 = 32 windows)
+    # - We divide total windows by windows per image to get B: B = 32 / 4 = 8
     B = int(windows.shape[0] / (H * W / window_size / window_size))
+
+    # Reshape from (num_windows * B, window_size * window_size, C) -> (B, num_windows_h, num_windows_w, window_size, window_size, C)
+    #   * Stage 3: (B * 4, 196, 160) -> (B, 2, 2, 14, 14, 160)
+    #   * Stage 4: (B * 4, 49, 320)  -> (B, 2, 2, 7, 7, 320)
     x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
+
+    # permute(0, 5, 1, 3, 2, 4): rearranges dimensions to (B, C, num_windows_h, window_size_h, num_windows_w, window_size_w)
+    #   * Stage 3: (B, 2, 2, 14, 14, 160) -> (B, 160, 2, 14, 2, 14)
+    #   * Stage 4: (B, 2, 2, 7, 7, 320)   -> (B, 320, 2, 7, 2, 7)
+    # reshape(B, C, H, W): merges (num_windows_h * window_size_h) into H, and (num_windows_w * window_size_w) into W
+    #   * Stage 3: (B, 160, 2, 14, 2, 14) -> (B, 160, 28, 28)
+    #   * Stage 4: (B, 320, 2, 7, 2, 7)   -> (B, 320, 14, 14)
     x = x.permute(0, 5, 1, 3, 2, 4).reshape(B,windows.shape[2], H, W)
     return x
 
@@ -147,7 +164,7 @@ def _load_state_dict(module, state_dict, strict=False, logger=None):
     state_dict = state_dict.copy()
     if metadata is not None:
         state_dict._metadata = metadata
-    
+
     def load(module, prefix=''):
         local_metadata = {} if metadata is None else metadata.get(
             prefix[:-1], {})
@@ -171,7 +188,7 @@ def _load_state_dict(module, state_dict, strict=False, logger=None):
         err_msg.append(
             f'missing keys in source state_dict: {", ".join(missing_keys)}\n')
 
-    
+
     if len(err_msg) > 0:
         err_msg.insert(
             0, 'The model and loaded state dict do not match exactly\n')
@@ -245,6 +262,9 @@ class Downsample(nn.Module):
             dim_out = dim
         else:
             dim_out = 2 * dim
+
+        # Noted that: kernel_size=3, stride=2, padding=1 -> H, W down by 2, C update by 2 in line 247 if keep_dim=False.
+        # This layer is used to reduce the resolution of the feature map and increase the number of channels.
         self.reduction = nn.Sequential(
             nn.Conv2d(dim, dim_out, 3, 2, 1, bias=False),
         )
@@ -269,15 +289,17 @@ class PatchEmbed(nn.Module):
         super().__init__()
         self.proj = nn.Identity()
         self.conv_down = nn.Sequential(
-            nn.Conv2d(in_chans, in_dim, 3, 2, 1, bias=False),
+            nn.Conv2d(in_chans, in_dim, 3, 2, 1, bias=False), # Noted that: kernel_size=3, stride=2, padding=1 -> H, W down by 2. Ex: for mamba_vision_T: (B, 3, 224, 224) -> (B, 32, 112, 112); for mamba_vision_S: (B, 3, 224, 224) -> (B, 64, 112, 112).
             nn.BatchNorm2d(in_dim, eps=1e-4),
             nn.ReLU(),
-            nn.Conv2d(in_dim, dim, 3, 2, 1, bias=False),
+            nn.Conv2d(in_dim, dim, 3, 2, 1, bias=False), # Noted that: kernel_size=3, stride=2, padding=1 -> H, W down by 2. Ex: for mamba_vision_T: (B, 32, 112, 112) -> (B, 80, 56, 56); for mamba_vision_S: (B, 64, 112, 112) -> (B, 96, 56, 56).
             nn.BatchNorm2d(dim, eps=1e-4),
             nn.ReLU()
             )
 
     def forward(self, x):
+        # x shape: (B, 3, 224, 224)
+        # output shape: (B, dim, H/4, W/4)
         x = self.proj(x)
         x = self.conv_down(x)
         return x
@@ -291,18 +313,26 @@ class ConvBlock(nn.Module):
                  kernel_size=3):
         super().__init__()
 
-        self.conv1 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1)
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1) # Noted that: kernel_size=3, stride=1, padding=1 -> H, W keep the same as input. Ex: for mamba_vision_T in Stage 1: (B, 80, 56, 56) -> (B, 80, 56, 56); in Stage 2: (B, 160, 28, 28) -> (B, 160, 28, 28).
         self.norm1 = nn.BatchNorm2d(dim, eps=1e-5)
         self.act1 = nn.GELU(approximate= 'tanh')
-        self.conv2 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1) # Noted that: kernel_size=3, stride=1, padding=1 -> H, W keep the same as input. Ex: for mamba_vision_T in Stage 1: (B, 80, 56, 56) -> (B, 80, 56, 56); in Stage 2: (B, 160, 28, 28) -> (B, 160, 28, 28).
         self.norm2 = nn.BatchNorm2d(dim, eps=1e-5)
         self.layer_scale = layer_scale
         if layer_scale is not None and type(layer_scale) in [int, float]:
-            self.gamma = nn.Parameter(layer_scale * torch.ones(dim))
+            self.gamma = nn.Parameter(layer_scale * torch.ones(dim)) # Shape: (dim,)
             self.layer_scale = True
         else:
             self.layer_scale = False
+        # Layer Scale (Optional) is a technique used to improve the training stability of deep neural networks, especially Transformers.
+        # Note: In default configurations, this is only enabled in the hybrid blocks (Block class) of mamba_vision_B and all large variants (L, L2, L3).
+        # In ConvBlock, it is always None (disabled) by default.
+
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        # DropPath (Stochastic Depth) randomly drops entire paths/blocks to prevent overfitting and improve training stability.
+        # Only active during the training phase, behaves as an Identity layer during inference.
+        # Note: The feature tensors of randomly selected images in a batch are set to zero, but the overall shape remains unchanged.
+
 
     def forward(self, x):
         input = x
@@ -314,6 +344,8 @@ class ConvBlock(nn.Module):
         if self.layer_scale:
             x = x * self.gamma.view(1, -1, 1, 1)
         x = input + self.drop_path(x)
+        # Residual Connection for output avoiding vanishing/exploding gradient
+        # Shape x: (B, C, H, W) the same as input. Ex: for mamba_vision_T: (B, 80, 56, 56) -> (B, 80, 56, 56)
         return x
 
 
@@ -332,26 +364,30 @@ class MambaVisionMixer(nn.Module):
         dt_init_floor=1e-4,
         conv_bias=True,
         bias=False,
-        use_fast_path=True, 
+        use_fast_path=True,
         layer_idx=None,
         device=None,
         dtype=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
-        self.layer_idx = layer_idx
-        self.in_proj = nn.Linear(self.d_model, self.d_inner, bias=bias, **factory_kwargs)    
+        self.d_model = d_model # Number of input channels
+        self.d_state = d_state # SSM state dimension
+        self.d_conv = d_conv # Kernel size of the local convolution
+        self.expand = expand # Expansion factor for the intermediate dimension
+        self.d_inner = int(self.expand * self.d_model) # Intermediate dimension
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank # Rank for time-step dependent projection
+        self.use_fast_path = use_fast_path # Use fast path for SSM
+        self.layer_idx = layer_idx # Index of the layer in the model
+        self.in_proj = nn.Linear(self.d_model, self.d_inner, bias=bias, **factory_kwargs) # Input projection
         self.x_proj = nn.Linear(
             self.d_inner//2, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
+        ) # Receive input x in one branch with shape (B, D/2, L) and project to (B, D/2, dt_rank + d_state*2) to prepare for splitting into dt, B, C
+
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner//2, bias=True, **factory_kwargs)
+        # dt_proj is the learnable parameter that controls the time-step dependent projection
+        # dt_proj has shape (d_inner//2, dt_rank)
+
         dt_init_std = self.dt_rank**-0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(self.dt_proj.weight, dt_init_std)
@@ -372,9 +408,13 @@ class MambaVisionMixer(nn.Module):
             "n -> d n",
             d=self.d_inner//2,
         ).contiguous()
+        # Init matrix A with value in matrix start 1-> d_state. Shape (d_inner/2, d_state)
         A_log = torch.log(A)
+        # Log of SSM Matrix A.
         self.A_log = nn.Parameter(A_log)
+        # Log of SSM Matrix A. Shape (d_inner/2, d_state). For model to learn
         self.A_log._no_weight_decay = True
+        # Disable weight decay for A_log
         self.D = nn.Parameter(torch.ones(self.d_inner//2, device=device))
         self.D._no_weight_decay = True
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
@@ -397,37 +437,59 @@ class MambaVisionMixer(nn.Module):
 
     def forward(self, hidden_states):
         """
-        hidden_states: (B, L, D)
+        hidden_states: (B, L, D) with B is batch size, L is sequence length, D is feature size and it was a Chanel.
         Returns: same shape as hidden_states
         """
         _, seqlen, _ = hidden_states.shape
         xz = self.in_proj(hidden_states)
+        # Shape (B, L, D) -> (B, L, D). Mean apply linear for both branch SSM and Symetric
         xz = rearrange(xz, "b l d -> b d l")
+        # Shape (B, L, D) -> (B, D, L)
         x, z = xz.chunk(2, dim=1)
+        # Split into 2 branch with x-SSM branch and z-Symetric branch have both shape: (B, D/2, L)
         A = -torch.exp(self.A_log.float())
+        # SSM Matrix A use (-) for get make sure A matrix always negative value because the torch.exp(self.A_log.float()) will be positive value and A matrix must be negative value.
         x = F.silu(F.conv1d(input=x, weight=self.conv1d_x.weight, bias=self.conv1d_x.bias, padding='same', groups=self.d_inner//2))
+        # x branch after apply conv1d and silu. Shape: (B, D/2, L)
         z = F.silu(F.conv1d(input=z, weight=self.conv1d_z.weight, bias=self.conv1d_z.bias, padding='same', groups=self.d_inner//2))
+        # z branch after apply conv1d and silu. Shape: (B, D/2, L)
+
+        # Start SSM
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        # 1. use rearrange for get x to get shape (B * L, D/2)
+        # 2. use x_proj to get shape (B * L, dt_rank + d_state * 2)
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        # Split x_dbl of shape (B * L, dt_rank + d_state * 2) into:
+        # - dt shape: (B * L, dt_rank)
+        # - B shape:  (B * L, d_state)
+        # - C shape:  (B * L, d_state)
         dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen)
+        # t shape: (B, D/2, L)
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        # B shape: (B, d_state, L)
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        y = selective_scan_fn(x, 
-                              dt, 
-                              A, 
-                              B, 
-                              C, 
-                              self.D.float(), 
-                              z=None, 
-                              delta_bias=self.dt_proj.bias.float(), 
-                              delta_softplus=True, 
+        # C shape: (B, d_state, L)
+        y = selective_scan_fn(x,
+                              dt,
+                              A,
+                              B,
+                              C,
+                              self.D.float(),
+                              z=None,
+                              delta_bias=self.dt_proj.bias.float(),
+                              delta_softplus=True,
                               return_last_state=None)
-        
+
         y = torch.cat([y, z], dim=1)
+        # Concat SSM branch and Symetric branch
+        # Shape (B, D/2, L) + (B, D/2, L) -> (B, D, L)
         y = rearrange(y, "b d l -> b l d")
+        # Shape (B, D, L) -> (B, L, D)
         out = self.out_proj(y)
+        # Linear projection
+        # Shape (B, L, D) -> (B, L, D)
         return out
-    
+
 
 class Attention(nn.Module):
 
@@ -446,6 +508,7 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        # mean sqrt(h) where h is head_dimension
         self.fused_attn = True
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -457,47 +520,56 @@ class Attention(nn.Module):
 
     def forward(self, x):
         B, N, C = x.shape
+        # Noted that B means Batchsize, N is number of sequence lenght, C is Chanel or Dimension
+
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        # 1. x shape (B, N, C) -> self.qkv(x) -> (B, N, 3C)
+        # 2. (B, N, 3C) -> reshape(B, N, 3, head_number, head_dimension)
+        # 3. (B, N, 3, head_number, head_dimension) -> permute(2, 0, 3, 1, 4) -> (3, B, head_number, N, head_dimension)
+
         q, k, v = qkv.unbind(0)
+        # q, k, v has shape (B, head_number, N, head_dimension)
+
         q, k = self.q_norm(q), self.k_norm(k)
+        # Normalize q and k by using layer norm
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(
-             q, k, v,
-                dropout_p=self.attn_drop.p,
-            )
+            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p) # Shape: (B, head_number, N, head_dimension)
         else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
+            q = q * self.scale # q / sqrt(head_dimension). Shape: (B, head_number, N, head_dimension)
+            attn = q @ k.transpose(-2, -1) # BMM: (B, head_number, N, head_dimension) @ (B, head_number, head_dimension, N) -> (B, head_number, N, N)
+            attn = attn.softmax(dim=-1) # Softmax over sequence length. Shape: (B, head_number, N, N)
+            attn = self.attn_drop(attn) # Apply dropout on attention weights. Shape: (B, head_number, N, N)
+            x = attn @ v # BMM: (B, head_number, N, N) @ (B, head_number, N, head_dimension) -> (B, head_number, N, head_dimension)
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        # 1. x.transpose(1, 2) -> (B, N, head_number, head_dimension)
+        # 2. reshape(B, N, C) -> (B, N, C)
+        x = self.proj(x) # Shape: (B, N, C)
+        x = self.proj_drop(x) # Shape: (B, N, C)
         return x
 
-
+# Block in Step 3, 4 use MambaVision Mixer / Attention + MLP
 class Block(nn.Module):
-    def __init__(self, 
-                 dim, 
-                 num_heads, 
-                 counter, 
-                 transformer_blocks, 
-                 mlp_ratio=4., 
-                 qkv_bias=False, 
-                 qk_scale=False, 
-                 drop=0., 
+    def __init__(self,
+                 dim,
+                 num_heads,
+                 counter,
+                 transformer_blocks,
+                 mlp_ratio=4.,
+                 qkv_bias=False,
+                 qk_scale=False,
+                 drop=0.,
                  attn_drop=0.,
-                 drop_path=0., 
-                 act_layer=nn.GELU, 
-                 norm_layer=nn.LayerNorm, 
+                 drop_path=0.,
+                 act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm,
                  Mlp_block=Mlp,
                  layer_scale=None,
                  ):
         super().__init__()
         self.norm1 = norm_layer(dim)
+        # Shape (B, L, D) -> (B, L, D)
         if counter in transformer_blocks:
             self.mixer = Attention(
             dim,
@@ -509,23 +581,47 @@ class Block(nn.Module):
             norm_layer=norm_layer,
         )
         else:
-            self.mixer = MambaVisionMixer(d_model=dim, 
-                                          d_state=8,  
-                                          d_conv=3,    
+            self.mixer = MambaVisionMixer(d_model=dim,
+                                          d_state=8,
+                                          d_conv=3,
                                           expand=1
                                           )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
+        # Shape (B, L, D) -> (B, L, D)
         mlp_hidden_dim = int(dim * mlp_ratio)
+        # mlp_hidden_din means hidden_features of mlp
+        # For example, if dim = 320 and mlp_ratio = 4.0, then mlp_hidden_dim = 320 * 4.0 = 1280 you can see in https://github.com/huggingface/pytorch-image-models/blob/main/timm/layers/mlp.py
         self.mlp = Mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        # Shape (B, L, D) -> (B, L, D)
         use_layer_scale = layer_scale is not None and type(layer_scale) in [int, float]
         self.gamma_1 = nn.Parameter(layer_scale * torch.ones(dim))  if use_layer_scale else 1
+        # Shape of gamma_1: (D,)
         self.gamma_2 = nn.Parameter(layer_scale * torch.ones(dim))  if use_layer_scale else 1
+        # Shape of gamma_2: (D,)
+        # Benefit of layer scale : stability of training.
+        # In the early stage of training, the weight of the network is initialized randomly, so the gradient is large.
+        # The layer scale can reduce the gradient and prevent the model from diverging.
+        # In the later stage of training, the layer scale can increase the gradient and prevent the model from overfitting.
+        # In addition, layer scale can help the model to learn long-range dependencies and reduce the model's sensitivity to noise.
+        # In summary, layer scale is a useful technique for training deep neural networks.
 
     def forward(self, x):
         x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x)))
+        # x: input tensor of shape (B, L, D). L is the number of tokens, D is the feature dimension.
+        # self.norm1(x): LayerNorm. Shape (B, L, D) -> (B, L, D)
+        # self.mixer(...): Mixer. Shape (B, L, D) -> (B, L, D)
+        # self.gamma_1: Scalar. Shape (D,). Multiplies with the output of the mixer.
+        # self.drop_path(...): DropPath. Shape (B, L, D) -> (B, L, D)
+        # x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x))): Residual connection with layer scaling. Shape (B, L, D)
+
         x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+        # self.norm2(x): LayerNorm. Shape (B, L, D) -> (B, L, D)
+        # self.mlp(...): MLP. Shape (B, L, D) -> (B, L, D)
+        # self.gamma_2: Scalar. Shape (D,). Multiplies with the output of the mlp.
+        # self.drop_path(...): DropPath. Shape (B, L, D) -> (B, L, D)
+        # x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x))): Residual connection with layer scaling. Shape (B, L, D)
         return x
 
 
@@ -565,7 +661,7 @@ class MambaVisionLayer(nn.Module):
             drop: dropout rate.
             attn_drop: attention dropout rate.
             drop_path: drop path rate.
-            norm_layer: normalization layer.
+            norm_layer: normaization layer.
             layer_scale: layer scaling coefficient.
             layer_scale_conv: conv layer scaling coefficient.
             transformer_blocks: list of transformer blocks.
@@ -575,14 +671,28 @@ class MambaVisionLayer(nn.Module):
         self.conv = conv
         self.transformer_block = False
         if conv:
+            # Stage 1 and 2: Create a list of ConvBlocks.
+            # - i is the block index generated by Python's list comprehension: for i in range(depth) (e.g. 0 to depth-1).
+            # - drop_path[i] retrieves the specific drop path rate allocated for the i-th block in this stage.
             self.blocks = nn.ModuleList([ConvBlock(dim=dim,
                                                    drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                                                    layer_scale=layer_scale_conv)
                                                    for i in range(depth)])
             self.transformer_block = False
         else:
+            # Stage 3 and 4: Create a list of hybrid Blocks.
+            # - i is the block index generated by: for i in range(depth) (e.g. 0 to depth-1).
+            # - counter=i is passed to the Block to identify its position in the stage (to choose Mamba vs Attention).
+            #   * Example (Tiny Model):
+            #     - Stage 3 (depth=8, transformer_blocks=[4, 5, 6, 7]):
+            #       i = 0 to 3 -> counter not in transformer_blocks -> MambaVisionMixer.
+            #       i = 4 to 7 -> counter in transformer_blocks -> Attention.
+            #     - Stage 4 (depth=4, transformer_blocks=[2, 3]):
+            #       i = 0 to 1 -> counter not in transformer_blocks -> MambaVisionMixer.
+            #       i = 2 to 3 -> counter in transformer_blocks -> Attention.
+            # - drop_path[i] selects the specific drop path rate for this block from the pre-computed schedule list.
             self.blocks = nn.ModuleList([Block(dim=dim,
-                                               counter=i, 
+                                               counter=i,
                                                transformer_blocks=transformer_blocks,
                                                num_heads=num_heads,
                                                mlp_ratio=mlp_ratio,
@@ -604,24 +714,52 @@ class MambaVisionLayer(nn.Module):
 
         if self.transformer_block:
             pad_r = (self.window_size - W % self.window_size) % self.window_size
+            # Calculate the amount of padding needed to make the width divisible by the window size.
+            # Example (Stage 3): W = 20, window_size = 14 -> W % window_size = 6 -> pad_r = (14 - 6) % 14 = 8 columns
+            # Example (Stage 4): W = 10, window_size = 7  -> W % window_size = 3 -> pad_r = (7 - 3) % 7 = 4 columns
+            # If W is already divisible (e.g. W = 28 for Stage 3 or W = 14 for Stage 4): pad_r = 0 (no padding)
             pad_b = (self.window_size - H % self.window_size) % self.window_size
+            # Same calculation for height padding
+
             if pad_r > 0 or pad_b > 0:
                 x = torch.nn.functional.pad(x, (0,pad_r,0,pad_b))
+                # pad right by pad_r and bottom by pad_b
                 _, _, Hp, Wp = x.shape
+                # Save padded height and width for reverse window function
+                # Example (Stage 3): if H, W = 20, window_size = 14 -> Hp, Wp = 28, 28
+                # Example (Stage 4): if H, W = 10, window_size = 7  -> Hp, Wp = 14, 14
             else:
                 Hp, Wp = H, W
+                # no padding needed
             x = window_partition(x, self.window_size)
+            # Partition the padded feature map into non-overlapping windows:
+            # - Example (Stage 3): Hp, Wp = 28, 28, ws = 14 -> (28/14)*(28/14) = 4 windows. Shape: (B * 4, 196, C)
+            # - Example (Stage 4): Hp, Wp = 14, 14, ws = 7  -> (14/7)*(14/7)   = 4 windows. Shape: (B * 4, 49, C)
 
         for _, blk in enumerate(self.blocks):
             x = blk(x)
+            # Process each block (ConvBlock or Block)
+            # ConvBlock: (when self.transformer_block = False)
+            # - Input/Output shape: (B, C, H, W) -> e.g. Stage 1: (B, 80, 56, 56)
+            # Block: (when self.transformer_block = True)
+            # - Input/Output shape: (num_windows * B, window_size * window_size, C)
+            #   * Stage 3: (B * 4, 196, 160)
+            #   * Stage 4: (B * 4, 49, 320)
         if self.transformer_block:
             x = window_reverse(x, self.window_size, Hp, Wp)
             if pad_r > 0 or pad_b > 0:
                 x = x[:, :, :H, :W].contiguous()
+                # Remove the padding back to original size:
+                # - Example (Stage 3): Hp, Wp = 28, 28 -> crop back to (B, C, 20, 20)
+                # - Example (Stage 4): Hp, Wp = 14, 14 -> crop back to (B, C, 10, 10)
+            # Reverse window partition: Reshape from (num_windows*B, window_size*window_size, C) back to (B, C, H, W)
+            # * Stage 3: (B * 4, 196, 160) -> (B, 160, 28, 28)
+            # * Stage 4: (B * 4, 49, 320)  -> (B, 320, 14, 14)
         if self.downsample is None:
             return x
-        return self.downsample(x)
-
+            # After stage 4, self.downsample is None
+            # so return x
+        return self.downsample(x) # ALL 3 stages 1, 2, 3
 
 class MambaVision(nn.Module):
     """
@@ -664,13 +802,44 @@ class MambaVision(nn.Module):
             layer_scale_conv: conv layer scaling coefficient.
         """
         super().__init__()
+        # num_features represents the output dimension of the final stage (Stage 4) before classification.
+        # - The initial dimension is dim (e.g. 80 for Tiny).
+        # - The number of channels doubles at the end of Stage 1, Stage 2, and Stage 3 (3 times total).
+        # - Hence: num_features = dim * 2^(number_of_stages - 1) = 80 * 2^(4-1) = 80 * 8 = 640.
         num_features = int(dim * 2 ** (len(depths) - 1))
         self.num_classes = num_classes
+
         self.patch_embed = PatchEmbed(in_chans=in_chans, in_dim=in_dim, dim=dim)
+        # Create patch embedding (stem block) to convert raw RGB images to patch tokens.
+        # For Tiny: input shape (B, 3, 224, 224) -> (B, 80, 56, 56)
+
+        # Stochastic Depth Rate Schedule (DropPath):
+        # - Shallow blocks extract basic features and should rarely be dropped (rate starts at 0).
+        # - Deeper blocks extract abstract semantic features and can be dropped more often to avoid overfitting (up to drop_path_rate).
+        # - linspace(0, drop_path_rate, sum(depths)) generates a list of rates increasing linearly across all sum(depths) blocks.
+        # - E.g. for Tiny, sum(depths) = 16 blocks. linspace(0, 0.2, 16) yields [0.0, 0.0133, ..., 0.2]
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+
         self.levels = nn.ModuleList()
         for i in range(len(depths)):
+            # Stage 1 (i=0) and Stage 2 (i=1) are CNN-based (conv=True)
+            # Stage 3 (i=2) and Stage 4 (i=3) are Hybrid Mamba/Attention (conv=False)
             conv = True if (i == 0 or i == 1) else False
+            
+            # The dimension dim doubles at each subsequent stage: 
+            # - i=0: dim=80
+            # - i=1: dim=160
+            # - i=2: dim=320
+            # - i=3: dim=640 (for Tiny)
+            # downsample=(i < 3) means downsampling is applied at the end of Stages 1, 2, and 3.
+            # transformer_blocks specifies the list of block indices in Hybrid stages that run Attention instead of Mamba.
+            # Formula logic:
+            # - If D = depths[i] is Even (e.g. D = 8 in Stage 3 of Tiny):
+            #   D % 2 != 0 is False -> else branch is chosen: list(range(D // 2, D)) = list(range(4, 8)) = [4, 5, 6, 7]
+            #   (Blocks 0-3 run Mamba, blocks 4-7 run Attention)
+            # - If D = depths[i] is Odd (e.g. D = 11 in Stage 3 of Tiny2):
+            #   D % 2 != 0 is True -> if branch is chosen: list(range(D // 2 + 1, D)) = list(range(6, 11)) = [6, 7, 8, 9, 10]
+            #   (Blocks 0-5 run Mamba, blocks 6-10 run Attention)
             level = MambaVisionLayer(dim=int(dim * 2 ** i),
                                      depth=depths[i],
                                      num_heads=num_heads[i],
@@ -688,12 +857,19 @@ class MambaVision(nn.Module):
                                      transformer_blocks=list(range(depths[i]//2+1, depths[i])) if depths[i]%2!=0 else list(range(depths[i]//2, depths[i])),
                                      )
             self.levels.append(level)
+            
+        # Final normalization layer before classification
         self.norm = nn.BatchNorm2d(num_features)
+        
+        # Global Average Pooling: pools spatial H x W resolution to 1x1
         self.avgpool = nn.AdaptiveAvgPool2d(1)
+        
+        # Classification head: projects final num_features channels to num_classes logits
         self.head = nn.Linear(num_features, num_classes) if num_classes > 0 else nn.Identity()
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
+        # Custom weights initialization for training stability
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
             if isinstance(m, nn.Linear) and m.bias is not None:
@@ -713,24 +889,41 @@ class MambaVision(nn.Module):
         return {'rpb'}
 
     def forward_features(self, x):
+        # 1. Stem Patch Embedding: (B, 3, 224, 224) -> (B, 80, 56, 56)
         x = self.patch_embed(x)
+        
+        # 2. Sequential Stage processing (Levels 1 to 4):
+        # - level 0 (Stage 1): (B, 80, 56, 56) -> (B, 160, 28, 28)
+        # - level 1 (Stage 2): (B, 160, 28, 28) -> (B, 320, 14, 14)
+        # - level 2 (Stage 3): (B, 320, 14, 14) -> (B, 640, 7, 7)
+        # - level 3 (Stage 4): (B, 640, 7, 7)   -> (B, 640, 7, 7)
         for level in self.levels:
             x = level(x)
+            
+        # 3. Final normalization and pooling:
+        # - norm: (B, 640, 7, 7) -> (B, 640, 7, 7)
+        # - avgpool: (B, 640, 7, 7) -> (B, 640, 1, 1)
+        # - flatten: (B, 640, 1, 1) -> (B, 640)
         x = self.norm(x)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
         return x
 
     def forward(self, x):
+        # Forward pass: Extract features and project to class logits
+        # - input x: (B, 3, 224, 224)
+        # - forward_features(x): (B, 640)
+        # - head: (B, 640) -> (B, 1000)
         x = self.forward_features(x)
         x = self.head(x)
         return x
 
-    def _load_state_dict(self, 
-                         pretrained, 
+    def _load_state_dict(self,
+                         pretrained,
                          strict: bool = False):
-        _load_checkpoint(self, 
-                         pretrained, 
+        # Load weights from checkpoint file
+        _load_checkpoint(self,
+                         pretrained,
                          strict=strict)
 
 
